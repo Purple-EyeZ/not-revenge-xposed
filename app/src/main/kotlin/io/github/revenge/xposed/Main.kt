@@ -140,7 +140,7 @@ class Main : IXposedHookLoadPackage {
 
                 val url = 
                     if (config.customLoadUrl.enabled) config.customLoadUrl.url 
-                    else "https://github.com/revenge-mod/revenge-bundle/releases/latest/download/revenge.min.js"
+                    else "https://github.com/Purple-EyeZ/not-revenge-bundle-next/releases/latest/download/revenge.bundle"
 
                 Log.e("Revenge", "Fetching JS bundle from $url")
                 
