@@ -3,149 +3,133 @@ package io.github.revenge.xposed
 import android.app.Activity
 import android.content.res.AssetManager
 import android.content.res.Resources
-import android.util.Log
 import android.os.Bundle
 import android.widget.Toast
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import io.github.revenge.xposed.BuildConfig
+import io.github.revenge.xposed.modules.FontsModule
+import io.github.revenge.xposed.modules.LogBoxModule
+import io.github.revenge.xposed.modules.NativeBridgeModule
+import io.github.revenge.xposed.modules.SysColorsModule
+import io.github.revenge.xposed.modules.ThemeModule
+import io.github.revenge.xposed.Utils.Companion.JSON
+import io.github.revenge.xposed.Utils.Log
 import io.ktor.client.*
 import io.ktor.client.call.*
-import io.ktor.client.request.*
 import io.ktor.client.engine.cio.*
-import io.ktor.client.statement.*
 import io.ktor.client.plugins.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.coroutines.*
-import kotlinx.serialization.*
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import java.io.File
 
 @Serializable
 data class CustomLoadUrl(
-    val enabled: Boolean,
-    val url: String
+    val enabled: Boolean = false,
+    val url: String = ""
 )
 
 @Serializable
 data class LoaderConfig(
-    val customLoadUrl: CustomLoadUrl
+    val customLoadUrl: CustomLoadUrl = CustomLoadUrl()
 )
 
-class Main : IXposedHookLoadPackage {
-    private val modules: Array<Module> = arrayOf(
+class Main : Module(), IXposedHookLoadPackage {
+    private lateinit var preloadsDir: File
+    private lateinit var bundle: File
+    private lateinit var httpJob: Deferred<Unit>
+
+    private lateinit var activity: Activity
+    private val onActivityCreate: ((Activity) -> Unit) -> Unit =
+        { if (::activity.isInitialized) it(activity) else onActivityCreateCallbacks.add(it) }
+    private val onActivityCreateCallbacks = mutableSetOf<(Activity) -> Unit>()
+
+    val PRELOADS_DIR = "preloads"
+
+    val ETAG_FILE = "etag.txt"
+    val CONFIG_FILE = "loader.json"
+
+    val LOADER_NAME = "RevengeXposed"
+
+    val DEFAULT_BUNDLE_URL = "https://github.com/Purple-EyeZ/not-revenge-bundle-next/releases/latest/download/revenge.bundle"
+
+    val TARGET_PACKAGE = "com.discord"
+    val TARGET_ACTIVITY = "$TARGET_PACKAGE.react_activities.ReactActivity"
+
+    private val modules = listOf(
         ThemeModule(),
         SysColorsModule(),
         FontsModule(),
-        LogBoxModule()
+        LogBoxModule(),
+        NativeBridgeModule()
     )
 
-    fun buildLoaderJsonString(): String {
-        val obj = buildJsonObject {
-            put("loaderName", "RevengeXposed")
+    private fun getPayloadString(): String = JSON.encodeToString(
+        buildJsonObject {
+            put("loaderName", LOADER_NAME)
             put("loaderVersion", BuildConfig.VERSION_NAME)
+            for (module in modules) module.buildPayload(this)
+        }
+    )
 
-            for (module in modules) {
-                module.buildJson(this)
+    override fun handleLoadPackage(param: XC_LoadPackage.LoadPackageParam) = with(param) {
+        val reactActivity = classLoader.safeLoadClass(TARGET_ACTIVITY)
+            ?: return
+
+        reactActivity.hookMethod("onCreate", Bundle::class.java) {
+            before {
+                activity = thisObject as Activity
+                this@Main.onCreate(activity)
             }
         }
 
-        return Json.encodeToString(obj)
+        init(param)
     }
 
-    override fun handleLoadPackage(param: XC_LoadPackage.LoadPackageParam) = with (param) {
-        val reactActivity = runCatching {
-            classLoader.loadClass("com.discord.react_activities.ReactActivity")
-        }.getOrElse { return@with } // Package is not our the target app, return
-
-        var activity: Activity? = null;
-        val onActivityCreateCallback = mutableSetOf<(activity: Activity) -> Unit>()
-
-        XposedBridge.hookMethod(reactActivity.getDeclaredMethod("onCreate", Bundle::class.java), object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                activity = param.thisObject as Activity
-                onActivityCreateCallback.forEach { cb -> cb(activity) }
-                onActivityCreateCallback.clear()
-            }
-        })
-
-        init(param) { cb ->
-            if (activity != null) cb(activity)
-            else onActivityCreateCallback.add(cb)
-        }
+    override fun onCreate(activity: Activity) {
+        for (module in modules) module.onCreate(activity)
+        for (cb in onActivityCreateCallbacks) cb(activity)
+        onActivityCreateCallbacks.clear()
     }
 
     private fun init(
         param: XC_LoadPackage.LoadPackageParam,
-        onActivityCreate: ((activity: Activity) -> Unit) -> Unit
-    ) = with (param) {
-        val catalystInstanceImpl = classLoader.loadClass("com.facebook.react.bridge.CatalystInstanceImpl")
+    ) = with(param) {
+        val cacheDir = File(appInfo.dataDir, Constants.CACHE_DIR).apply { asDir() }
+        val filesDir = File(appInfo.dataDir, Constants.FILES_DIR).apply { asDir() }
 
-        for (module in modules) module.onInit(param)
+        preloadsDir = File(filesDir, PRELOADS_DIR).apply { asDir() }
+        bundle = File(cacheDir, Constants.BUNDLE_FILE).apply { asFile() }
 
-        val loadScriptFromAssets = catalystInstanceImpl.getDeclaredMethod(
-            "loadScriptFromAssets",
-            AssetManager::class.java,
-            String::class.java,
-            Boolean::class.javaPrimitiveType
-        ).apply { isAccessible = true }
+        val etag = File(cacheDir, ETAG_FILE).apply { asFile() }
+        val configFile = File(filesDir, CONFIG_FILE).apply { asFile() }
 
-        val loadScriptFromFile = catalystInstanceImpl.getDeclaredMethod(
-            "loadScriptFromFile",
-            String::class.java,
-            String::class.java,
-            Boolean::class.javaPrimitiveType
-        ).apply { isAccessible = true }
+        val config = runCatching {
+            JSON.decodeFromString<LoaderConfig>(configFile.readText())
+        }.getOrDefault(LoaderConfig())
 
-        val setGlobalVariable = catalystInstanceImpl.getDeclaredMethod(
-            "setGlobalVariable",
-            String::class.java,
-            String::class.java
-        ).apply { isAccessible = true }
-
-        val cacheDir = File(appInfo.dataDir, "cache/pyoncord").apply { mkdirs() }
-        val filesDir = File(appInfo.dataDir, "files/pyoncord").apply { mkdirs() }
-
-        val preloadsDir = File(filesDir, "preloads").apply { mkdirs() }
-        val bundle = File(cacheDir, "bundle.js")
-        val etag = File(cacheDir, "etag.txt")
-
-        val configFile = File(filesDir, "loader.json")
-
-        val config = try {
-            if (!configFile.exists()) throw Exception()
-            val json = Json { ignoreUnknownKeys = true }
-            json.decodeFromString(configFile.readText())
-        } catch (_: Exception) {
-            LoaderConfig(
-                customLoadUrl = CustomLoadUrl(
-                    enabled = false,
-                    url = "" // Not used
-                )
-            )
-        }
-
-        val scope = MainScope()
-        val httpJob = scope.async(Dispatchers.IO) {
-            try {
+        httpJob = MainScope().async(Dispatchers.IO) {
+            runCatching {
                 val client = HttpClient(CIO) {
                     expectSuccess = true
                     install(HttpTimeout) {
                         requestTimeoutMillis = if (bundle.exists()) 5000 else 10000
                     }
-                    install(UserAgent) { agent = "RevengeXposed" }
+                    install(UserAgent) { agent = Constants.USER_AGENT }
                 }
 
-                val url = 
-                    if (config.customLoadUrl.enabled) config.customLoadUrl.url 
-                    else "https://github.com/Purple-EyeZ/not-revenge-bundle-next/releases/latest/download/revenge.bundle"
+                val url = config.customLoadUrl.takeIf { it.enabled }?.url
+                    ?: DEFAULT_BUNDLE_URL
 
-                Log.e("Revenge", "Fetching JS bundle from $url")
-                
+                Log.i("Fetching JS bundle from $url")
+
                 val response: HttpResponse = client.get(url) {
-                    headers { 
+                    headers {
                         if (etag.exists() && bundle.exists()) {
                             append(HttpHeaders.IfNoneMatch, etag.readText())
                         }
@@ -153,79 +137,115 @@ class Main : IXposedHookLoadPackage {
                 }
 
                 bundle.writeBytes(response.body())
-                if (response.headers["Etag"] != null) {
-                    etag.writeText(response.headers["Etag"]!!)
-                }
-                else if (etag.exists()) {
-                    // This is called when server does not return an E-tag, so clear em
-                    etag.delete()
-                }
+                response.headers["Etag"]?.let(etag::writeText) ?: etag.delete()
 
-                return@async
-            } catch (e: RedirectResponseException) {
-                if (e.response.status != HttpStatusCode.NotModified) throw e;
-                Log.e("Revenge", "Server responded with status code 304 - no changes to file")
-            } catch (e: Throwable) {
-                onActivityCreate { activity ->
-                    activity.runOnUiThread {
-                        Toast.makeText(
-                            activity.applicationContext,
-                            "Failed to fetch JS bundle, Revenge may not load!",
-                            Toast.LENGTH_SHORT
-                        ).show()
+            }.onFailure { e ->
+                if (e is RedirectResponseException &&
+                    e.response.status == HttpStatusCode.NotModified
+                ) {
+                    Log.i("Server responded with 304 - no changes")
+                } else {
+                    onActivityCreate { activity ->
+                        activity.runOnUiThread {
+                            Toast.makeText(
+                                activity.applicationContext,
+                                "Failed to fetch JS bundle, Revenge may not load!",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
                     }
+                    Log.e("Failed to download bundle", e)
                 }
-
-                Log.e("Revenge", "Failed to download bundle", e)
             }
         }
+
+        listOf(
+            "com.facebook.react.runtime.ReactInstance$1",
+            "com.facebook.react.bridge.CatalystInstanceImpl"
+        ).mapNotNull { classLoader.safeLoadClass(it) }
+            .forEach { hookLoadScript(it) }
+
+        for (module in modules) module.onLoad(param)
+
+        // Fix resource package name mismatch
+        if (packageName != TARGET_PACKAGE) {
+            Resources::class.java.hookMethod(
+                "getIdentifier",
+                String::class.java,
+                String::class.java,
+                String::class.java
+            ) {
+                before {
+                    if (args[2] == packageName) args[2] = TARGET_PACKAGE
+                }
+            }
+        }
+    }
+
+    private fun hookLoadScript(
+        instance: Class<*>
+    ) {
+        val loadScriptFromAssets = instance.method(
+            "loadScriptFromAssets",
+            AssetManager::class.java,
+            String::class.java,
+            Boolean::class.javaPrimitiveType
+        )
+        val loadScriptFromFile = instance.method(
+            "loadScriptFromFile",
+            String::class.java,
+            String::class.java,
+            Boolean::class.javaPrimitiveType
+        )
+
+        val setGlobalVariable: (XC_MethodHook.MethodHookParam, String, String) -> Unit =
+            { param, key, json ->
+                runCatching {
+                    instance.method(
+                        "setGlobalVariable",
+                        String::class.java,
+                        String::class.java
+                    ).invoke(param.thisObject, key, json)
+                }.onFailure {
+                    // Bridgeless compatibility
+                    File(preloadsDir, "rv_globals_$key.js").apply {
+                        writeText("this[${JSON.encodeToString(key)}]=$json")
+                        XposedBridge.invokeOriginalMethod(
+                            loadScriptFromFile,
+                            param.thisObject,
+                            arrayOf(absolutePath, absolutePath, param.args[2])
+                        )
+                        delete()
+                    }
+                }
+            }
 
         val patch = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 runBlocking { httpJob.join() }
+                setGlobalVariable(param, "__PYON_LOADER__", getPayloadString())
 
-                XposedBridge.invokeOriginalMethod(
-                    setGlobalVariable, 
-                    param.thisObject, 
-                    arrayOf("__PYON_LOADER__", buildLoaderJsonString())
-                )
-
-                preloadsDir
-                    .walk()
+                preloadsDir.walk()
                     .filter { it.isFile && it.extension == "js" }
                     .forEach { file ->
                         XposedBridge.invokeOriginalMethod(
-                            loadScriptFromFile, 
-                            param.thisObject, 
+                            loadScriptFromFile,
+                            param.thisObject,
                             arrayOf(file.absolutePath, file.absolutePath, param.args[2])
                         )
                     }
 
                 XposedBridge.invokeOriginalMethod(
-                    loadScriptFromFile, 
-                    param.thisObject, 
+                    loadScriptFromFile,
+                    param.thisObject,
                     arrayOf(bundle.absolutePath, bundle.absolutePath, param.args[2])
                 )
             }
         }
 
-        XposedBridge.hookMethod(loadScriptFromAssets, patch)
-        XposedBridge.hookMethod(loadScriptFromFile, patch)
-
-        // Fighting the side effects of changing the package name
-        if (packageName != "com.discord") {
-            val getIdentifier = Resources::class.java.getDeclaredMethod(
-                "getIdentifier", 
-                String::class.java,
-                String::class.java,
-                String::class.java
-            )
-
-            XposedBridge.hookMethod(getIdentifier, object: XC_MethodHook() {
-                override fun beforeHookedMethod(mhparam: MethodHookParam) = with(mhparam) {
-                    if (args[2] == param.packageName) args[2] = "com.discord"
-                }
-            })
-        }
+        for (method in listOf(loadScriptFromAssets, loadScriptFromFile)) method.hook(patch)
     }
+
+    private fun ClassLoader.safeLoadClass(name: String): Class<*>? =
+        runCatching { loadClass(name) }.getOrNull()
 }
